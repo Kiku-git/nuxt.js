@@ -1,9 +1,10 @@
 #!/bin/bash
+set -e
 
 for dir in packages/* distributions/* ; do
- echo "$dir"
- pushd $dir
+ # echo "$dir"
+ pushd $dir > /dev/null
   $@
- popd
+ popd > /dev/null
 done
 

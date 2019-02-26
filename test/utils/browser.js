@@ -1,17 +1,28 @@
-import puppeteer from 'puppeteer'
+import puppeteer from 'puppeteer-core'
+
+import ChromeDetector from './chrome'
 
 export default class Browser {
+  constructor() {
+    this.detector = new ChromeDetector()
+  }
+
   async start(options = {}) {
     // https://github.com/GoogleChrome/puppeteer/blob/master/docs/api.md#puppeteerlaunchoptions
-    this.browser = await puppeteer.launch(
-      Object.assign(
-        {
-          args: ['--no-sandbox', '--disable-setuid-sandbox'],
-          executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
-        },
-        options
-      )
-    )
+    const _opts = {
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox'
+      ],
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+      ...options
+    }
+
+    if (!_opts.executablePath) {
+      _opts.executablePath = this.detector.detect()
+    }
+
+    this.browser = await puppeteer.launch(_opts)
   }
 
   async close() {
@@ -27,9 +38,13 @@ export default class Browser {
     await page.waitForFunction(`!!${page.$nuxtGlobalHandle}`)
     page.html = () =>
       page.evaluate(() => window.document.documentElement.outerHTML)
-    page.$text = selector => page.$eval(selector, el => el.textContent)
-    page.$$text = selector =>
-      page.$$eval(selector, els => els.map(el => el.textContent))
+    page.$text = (selector, trim) => page.$eval(selector, (el, trim) => {
+      return trim ? el.textContent.replace(/^\s+|\s+$/g, '') : el.textContent
+    }, trim)
+    page.$$text = (selector, trim) =>
+      page.$$eval(selector, (els, trim) => els.map((el) => {
+        return trim ? el.textContent.replace(/^\s+|\s+$/g, '') : el.textContent
+      }), trim)
     page.$attr = (selector, attr) =>
       page.$eval(selector, (el, attr) => el.getAttribute(attr), attr)
     page.$$attr = (selector, attr) =>

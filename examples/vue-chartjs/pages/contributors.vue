@@ -1,6 +1,6 @@
 <template>
   <div class="doughnut-chart">
-    <doughnut-chart :data="doughnutChartData" :options="{ legend: { display: false }, maintainAspectRatio: false }" />
+    <DoughnutChart :data="doughnutChartData" :options="{ legend: { display: false }, maintainAspectRatio: false }" />
   </div>
 </template>
 
@@ -18,6 +18,9 @@ function getRandomColor() {
 }
 
 export default {
+  components: {
+    DoughnutChart
+  },
   async asyncData({ env }) {
     const res = await axios.get(`https://api.github.com/repos/nuxt/nuxt.js/stats/contributors?access_token=${env.githubToken}`)
     return {
@@ -32,9 +35,6 @@ export default {
         ]
       }
     }
-  },
-  components: {
-    DoughnutChart
   }
 }
 </script>

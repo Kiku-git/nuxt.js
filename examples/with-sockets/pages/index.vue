@@ -5,7 +5,9 @@
         <div class="chatArea">
           <ul ref="messages" class="messages">
             <li v-for="(message, index) in messages" :key="index" class="message">
-              <i :title="message.date">{{ message.date.split('T')[1].slice(0, -2) }}</i>: {{ message.text }}
+              <i :title="message.date">
+                {{ message.date.split('T')[1].slice(0, -2) }}
+              </i>: {{ message.text }}
             </li>
           </ul>
         </div>
@@ -19,6 +21,9 @@
 import socket from '~/plugins/socket.io.js'
 
 export default {
+  watch: {
+    'messages': 'scrollToBottom'
+  },
   asyncData(context, callback) {
     socket.emit('last-messages', function (messages) {
       callback(null, {
@@ -26,9 +31,6 @@ export default {
         message: ''
       })
     })
-  },
-  watch: {
-    'messages': 'scrollToBottom'
   },
   beforeMount() {
     socket.on('new-message', (message) => {

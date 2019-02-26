@@ -1,5 +1,6 @@
+import path from 'path'
 import consola from 'consola'
-import { Builder, getPort, loadFixture, Nuxt, rp } from '../utils'
+import { Builder, BundleBuilder, getPort, loadFixture, Nuxt, rp } from '../utils'
 
 let port
 const url = route => 'http://localhost:' + port + route
@@ -10,6 +11,7 @@ let transpile = null
 let output = null
 let loadersOptions
 let vueLoader
+let postcssLoader
 
 describe('basic dev', () => {
   beforeAll(async () => {
@@ -25,7 +27,9 @@ describe('basic dev', () => {
           chunk: 'test-[name].[contenthash].js'
         },
         transpile: [
-          'vue\\.test\\.js',
+          '@scoped/packageA',
+          '@scoped\\packageB',
+          'vue.test.js',
           /vue-test/
         ],
         loaders: {
@@ -40,15 +44,17 @@ describe('basic dev', () => {
             output = wpOutput
             loadersOptions = loaders
             vueLoader = rules.find(loader => loader.test.test('.vue'))
+            const cssLoaders = rules.find(loader => loader.test.test('.css')).oneOf[0].use
+            postcssLoader = cssLoaders[cssLoaders.length - 1]
           }
         }
       }
     })
     nuxt = new Nuxt(config)
-    builder = new Builder(nuxt)
+    builder = new Builder(nuxt, BundleBuilder)
     await builder.build()
     port = await getPort()
-    await nuxt.listen(port, 'localhost')
+    await nuxt.server.listen(port, 'localhost')
   })
 
   test('Check build:done hook called', () => {
@@ -57,10 +63,12 @@ describe('basic dev', () => {
 
   test('Config: build.transpile', () => {
     expect(transpile('vue-test')).toBe(true)
-    expect(transpile('node_modules/test.js')).toBe(false)
-    expect(transpile('node_modules/vue-test')).toBe(true)
-    expect(transpile('node_modules/vue.test.js')).toBe(true)
-    expect(transpile('node_modules/test.vue.js')).toBe(true)
+    expect(transpile(path.normalize('node_modules/test.js'))).toBe(false)
+    expect(transpile(path.normalize('node_modules/vue-test'))).toBe(true)
+    expect(transpile(path.normalize('node_modules/vue.test.js'))).toBe(true)
+    expect(transpile(path.normalize('node_modules/test.vue.js'))).toBe(true)
+    expect(transpile(path.normalize('node_modules/@scoped/packageA/src/index.js'))).toBe(true)
+    expect(transpile(path.normalize('node_modules/@scoped/packageB/src/index.js'))).toBe(true)
   })
 
   test('Config: build.filenames', () => {
@@ -72,20 +80,33 @@ describe('basic dev', () => {
   })
 
   test('Config: build.loaders', () => {
-    expect(Object.keys(loadersOptions)).toHaveLength(12)
+    expect(Object.keys(loadersOptions)).toHaveLength(14)
     expect(loadersOptions).toHaveProperty(
       'file', 'fontUrl', 'imgUrl', 'pugPlain', 'vue',
-      'css', 'cssModules', 'less', 'sass', 'scss', 'stylus', 'vueStyle'
+      'css', 'cssModules', 'less', 'sass', 'scss', 'stylus', 'ts', 'tsx', 'vueStyle'
     )
     const { cssModules, vue } = loadersOptions
     expect(cssModules.localIdentName).toBe('[hash:base64:6]')
-    expect(vueLoader.options).toBe(vue)
+    expect(vueLoader.options).toEqual(vue)
+  })
+
+  test('Config: cssnano is at then end of postcss plugins', () => {
+    const plugins = postcssLoader.options.plugins.map((plugin) => {
+      return plugin.postcssPlugin
+    })
+    expect(plugins).toEqual([
+      'postcss-import',
+      'postcss-url',
+      'postcss-preset-env',
+      'nuxt-test',
+      'cssnano'
+    ])
   })
 
   test('/stateless', async () => {
-    const window = await nuxt.renderAndGetWindow(url('/stateless'))
+    const window = await nuxt.server.renderAndGetWindow(url('/stateless'))
     const html = window.document.body.innerHTML
-    expect(html.includes('<h1>My component!</h1>')).toBe(true)
+    expect(html).toContain('<h1>My component!</h1>')
   })
 
   test('Check render:routeDone hook called', () => {
@@ -117,20 +138,9 @@ describe('basic dev', () => {
   })
 
   test('/error should return error stack trace (Youch)', async () => {
-    await expect(nuxt.renderAndGetWindow(url('/error'))).rejects.toMatchObject({
+    await expect(nuxt.server.renderAndGetWindow(url('/error'))).rejects.toMatchObject({
       statusCode: 500
     })
-  })
-
-  test('/error no source-map (Youch)', async () => {
-    const sourceMaps = nuxt.renderer.resources.serverBundle.maps
-    nuxt.renderer.resources.serverBundle.maps = {}
-
-    await expect(nuxt.renderAndGetWindow(url('/error'))).rejects.toMatchObject({
-      statusCode: 500
-    })
-
-    nuxt.renderer.resources.serverBundle.maps = sourceMaps
   })
 
   test('/error should return json format error (Youch)', async () => {

@@ -1,60 +1,54 @@
-import parseArgs from 'minimist'
-import consola from 'consola'
+import { common } from '../options'
+import { normalizeArg } from '../utils'
 
-import { loadNuxtConfig } from '../common/utils'
-
-export default async function generate() {
-  const { Nuxt } = await import('@nuxt/core')
-  const { Builder, Generator } = await import('@nuxt/builder')
-
-  const argv = parseArgs(process.argv.slice(2), {
-    alias: {
-      h: 'help',
-      c: 'config-file',
-      s: 'spa',
-      u: 'universal'
+export default {
+  name: 'generate',
+  description: 'Generate a static web application (server-rendered)',
+  usage: 'generate <dir>',
+  options: {
+    ...common,
+    build: {
+      type: 'boolean',
+      default: true,
+      description: 'Only generate pages for dynamic routes. Nuxt has to be built once before using this option'
     },
-    boolean: ['h', 's', 'u', 'build'],
-    string: ['c'],
-    default: {
-      c: 'nuxt.config.js',
-      build: true
+    devtools: {
+      type: 'boolean',
+      default: false,
+      description: 'Enable Vue devtools',
+      prepare(cmd, options, argv) {
+        options.vue = options.vue || {}
+        options.vue.config = options.vue.config || {}
+        if (argv.devtools) {
+          options.vue.config.devtools = true
+        }
+      }
+    },
+    modern: {
+      ...common.modern,
+      description: 'Generate app in modern build (modern mode can be only client)',
+      prepare(cmd, options, argv) {
+        if (normalizeArg(argv.modern)) {
+          options.modern = 'client'
+        }
+      }
     }
-  })
+  },
+  async run(cmd) {
+    const config = await cmd.getNuxtConfig({ dev: false })
 
-  if (argv.help) {
-    process.stderr.write(`
-    Description
-      Generate a static web application (server-rendered)
-    Usage
-      $ nuxt generate <dir>
-    Options
-      --spa              Launch in SPA mode
-      --universal        Launch in Universal mode (default)
-      --config-file, -c  Path to Nuxt.js config file (default: nuxt.config.js)
-      --help, -h         Displays this message
-      --no-build         Just run generate for faster builds when just dynamic routes changed. Nuxt build is needed before this command.
-  `)
-    process.exit(0)
-  }
+    // Disable analyze if set by the nuxt config
+    if (!config.build) {
+      config.build = {}
+    }
+    config.build.analyze = false
 
-  const options = loadNuxtConfig(argv)
+    const nuxt = await cmd.getNuxt(config)
+    const generator = await cmd.getGenerator(nuxt)
 
-  options.dev = false // Force production mode (no webpack middleware called)
-
-  const nuxt = new Nuxt(options)
-  const builder = new Builder(nuxt)
-  const generator = new Generator(nuxt, builder)
-
-  const generateOptions = {
-    init: true,
-    build: argv.build
-  }
-
-  return generator
-    .generate(generateOptions)
-    .then(() => {
-      process.exit(0)
+    await generator.generate({
+      init: true,
+      build: cmd.argv.build
     })
-    .catch(err => consola.fatal(err))
+  }
 }

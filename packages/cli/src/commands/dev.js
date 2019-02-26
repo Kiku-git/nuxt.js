@@ -1,100 +1,87 @@
-import parseArgs from 'minimist'
 import consola from 'consola'
-import { loadNuxtConfig } from '../common/utils'
+import chalk from 'chalk'
+import opener from 'opener'
+import { common, server } from '../options'
+import { showBanner, eventsMapping, formatPath } from '../utils'
 
-export default async function dev() {
-  const { Nuxt } = await import('@nuxt/core')
-  const { Builder } = await import('@nuxt/builder')
-
-  const argv = parseArgs(process.argv.slice(2), {
-    alias: {
-      h: 'help',
-      H: 'hostname',
-      p: 'port',
-      c: 'config-file',
-      s: 'spa',
-      u: 'universal',
-      v: 'version'
-    },
-    boolean: ['h', 's', 'u', 'v'],
-    string: ['H', 'c'],
-    default: {
-      c: 'nuxt.config.js'
+export default {
+  name: 'dev',
+  description: 'Start the application in development mode (e.g. hot-code reloading, error reporting)',
+  usage: 'dev <dir>',
+  options: {
+    ...common,
+    ...server,
+    open: {
+      alias: 'o',
+      type: 'boolean',
+      description: 'Opens the server listeners url in the default browser'
     }
-  })
+  },
 
-  if (argv.version) {
-    process.stderr.write('TODO' + '\n')
-    process.exit(0)
-  }
+  async run(cmd) {
+    const { argv } = cmd
+    const nuxt = await this.startDev(cmd, argv)
 
-  if (argv.hostname === '') {
-    consola.fatal('Provided hostname argument has no value')
-  }
+    // Opens the server listeners url in the default browser
+    if (argv.open) {
+      const openerPromises = nuxt.server.listeners.map(listener => opener(listener.url))
+      await Promise.all(openerPromises)
+    }
+  },
 
-  if (argv.help) {
-    process.stderr.write(`
-    Description
-      Starts the application in development mode (hot-code reloading, error
-      reporting, etc)
-    Usage
-      $ nuxt dev <dir> -p <port number> -H <hostname>
-    Options
-      --port, -p          A port number on which to start the application
-      --hostname, -H      Hostname on which to start the application
-      --spa               Launch in SPA mode
-      --universal         Launch in Universal mode (default)
-      --config-file, -c   Path to Nuxt.js config file (default: nuxt.config.js)
-      --help, -h          Displays this message
-  `)
-    process.exit(0)
-  }
-
-  const config = () => {
-    // Force development mode for add hot reloading and watching changes
-    return Object.assign(loadNuxtConfig(argv), { dev: true })
-  }
-
-  const errorHandler = (err, instance) => {
-    instance && instance.builder.watchServer()
-    consola.error(err)
-  }
-
-  // Start dev
-  (function startDev(oldInstance) {
-    let nuxt, builder
-
+  async startDev(cmd, argv) {
     try {
-      nuxt = new Nuxt(config())
-      builder = new Builder(nuxt)
-      nuxt.hook('watch:fileChanged', (builder, fname) => {
-        consola.debug(`[${fname}] changed, Rebuilding the app...`)
-        startDev({ nuxt: builder.nuxt, builder })
-      })
-    } catch (err) {
-      return errorHandler(err, oldInstance)
-    }
+      const nuxt = await this._startDev(cmd, argv)
 
-    return (
-      Promise.resolve()
-        .then(() => oldInstance && oldInstance.nuxt.clearHook('watch:fileChanged'))
-        .then(() => oldInstance && oldInstance.builder.unwatch())
-        // Start build
-        .then(() => builder.build())
-        // Close old nuxt no mater if build successfully
-        .catch((err) => {
-          oldInstance && oldInstance.nuxt.close()
-          // Jump to eventHandler
-          throw err
-        })
-        .then(() => oldInstance && oldInstance.nuxt.close())
-        // Start listening
-        .then(() => nuxt.listen())
-        // Show ready message first time, others will be shown through WebpackBar
-        .then(() => !oldInstance && nuxt.showReady(false))
-        .then(() => builder.watchServer())
-        // Handle errors
-        .catch(err => errorHandler(err, { builder, nuxt }))
-    )
-  })()
+      return nuxt
+    } catch (error) {
+      consola.error(error)
+    }
+  },
+
+  async _startDev(cmd, argv) {
+    const config = await cmd.getNuxtConfig({ dev: true })
+    const nuxt = await cmd.getNuxt(config)
+
+    // Setup hooks
+    nuxt.hook('watch:restart', payload => this.onWatchRestart(payload, { nuxt, builder, cmd, argv }))
+    nuxt.hook('bundler:change', changedFileName => this.onBundlerChange(changedFileName))
+
+    // Start listening
+    await nuxt.server.listen()
+
+    // Create builder instance
+    const builder = await cmd.getBuilder(nuxt)
+
+    // Start Build
+    await builder.build()
+
+    // Show banner after build
+    showBanner(nuxt)
+
+    // Return instance
+    return nuxt
+  },
+
+  logChanged({ event, path }) {
+    const { icon, color, action } = eventsMapping[event] || eventsMapping.change
+
+    consola.log({
+      type: event,
+      icon: chalk[color].bold(icon),
+      message: `${action} ${chalk.cyan(formatPath(path))}`
+    })
+  },
+
+  async onWatchRestart({ event, path }, { nuxt, cmd, argv }) {
+    this.logChanged({ event, path })
+
+    await nuxt.close()
+
+    await this.startDev(cmd, argv)
+  },
+
+  onBundlerChange(path) {
+    this.logChanged({ event: 'change', path })
+  }
 }

@@ -2,10 +2,14 @@ import path from 'path'
 import compression from 'compression'
 
 export default {
+  mode: 'unknown',
   srcDir: __dirname,
   server: {
     port: 8000,
-    host: '0.0.0.0'
+    host: '0.0.0.0',
+    timing: {
+      total: true
+    }
   },
   router: {
     base: '/test/',
@@ -16,7 +20,8 @@ export default {
         {
           name: 'about-bis',
           path: '/about-bis',
-          component: '~/pages/about.vue'
+          component: '~/pages/about.vue',
+          meta: { text: 'test-meta' }
         },
         {
           path: '/redirect/about-bis',
@@ -35,6 +40,10 @@ export default {
   extensions: 'ts',
   plugins: [
     '~/plugins/test',
+    '~/plugins/doubled',
+    { src: '~/plugins/test.plugin', mode: 'abc' },
+    '~/plugins/test.client',
+    '~/plugins/test.server',
     { src: '~/plugins/only-client.js', ssr: false }
   ],
   loading: '~/components/loading',
@@ -61,7 +70,7 @@ export default {
       logLevel: 'error'
     },
     styleResources: {
-      scss: '~/assets/pre-process.scss'
+      css: './assets/pre-process.css'
     },
     babel: {
       presets({ isServer }) {
@@ -71,11 +80,11 @@ export default {
     transpile: 'vue-test',
     extend(config, options) {
       return Object.assign({}, config, {
-        devtool: 'nosources-source-map'
+        devtool: '#source-map'
       })
     }
   },
-  css: [{ src: '~/assets/app.css' }],
+  css: [{ src: '~/assets/app' }],
   render: {
     csp: true,
     http2: {

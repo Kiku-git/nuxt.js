@@ -1,144 +1,127 @@
 import path from 'path'
-import fs from 'fs'
-import pify from 'pify'
-import uniqBy from 'lodash/uniqBy'
-import map from 'lodash/map'
-import debounce from 'lodash/debounce'
-import concat from 'lodash/concat'
-import omit from 'lodash/omit'
-import uniq from 'lodash/uniq'
-import template from 'lodash/template'
-import values from 'lodash/values'
 import chokidar from 'chokidar'
-import fsExtra from 'fs-extra'
-import hash from 'hash-sum'
-import webpack from 'webpack'
-import serialize from 'serialize-javascript'
-import MFS from 'memory-fs'
-import webpackDevMiddleware from 'webpack-dev-middleware'
-import webpackHotMiddleware from 'webpack-hot-middleware'
-import Glob from 'glob'
-import upath from 'upath'
 import consola from 'consola'
+import fsExtra from 'fs-extra'
+import Glob from 'glob'
+import hash from 'hash-sum'
+import pify from 'pify'
+import upath from 'upath'
+import semver from 'semver'
 
-import devalue from '@nuxtjs/devalue'
+import debounce from 'lodash/debounce'
+import omit from 'lodash/omit'
+import template from 'lodash/template'
+import uniq from 'lodash/uniq'
+import uniqBy from 'lodash/uniqBy'
 
 import {
-  Options,
   r,
-  wp,
-  wChunk,
   createRoutes,
-  parallel,
-  sequence,
   relativeTo,
   waitFor,
-  determineGlobals
-} from '@nuxt/common'
+  determineGlobals,
+  stripWhitespace,
+  isString,
+  isIndexFileAndFolder
+} from '@nuxt/utils'
 
-import PerfLoader from './webpack/utils/perf-loader'
-import ClientWebpackConfig from './webpack/client'
-import ServerWebpackConfig from './webpack/server'
+import Ignore from './ignore'
+import BuildContext from './context/build'
+import TemplateContext from './context/template'
 
 const glob = pify(Glob)
 
 export default class Builder {
-  constructor(nuxt) {
+  constructor(nuxt, bundleBuilder) {
     this.nuxt = nuxt
-    this.isStatic = false // Flag to know if the build is for a generated app
+    this.plugins = []
     this.options = nuxt.options
     this.globals = determineGlobals(nuxt.options.globalName, nuxt.options.globals)
-
-    // Fields that set on build
-    this.compilers = []
-    this.compilersWatching = []
-    this.webpackDevMiddleware = null
-    this.webpackHotMiddleware = null
     this.watchers = {
       files: null,
       custom: null,
       restart: null
     }
-    this.perfLoader = null
+
+    this.supportedExtensions = ['vue', 'js', 'ts', 'tsx']
 
     // Helper to resolve build paths
-    this.relativeToBuild = (...args) =>
-      relativeTo(this.options.buildDir, ...args)
+    this.relativeToBuild = (...args) => relativeTo(this.options.buildDir, ...args)
 
     this._buildStatus = STATUS.INITIAL
 
-    // Stop watching on nuxt.close()
+    // Hooks for watch lifecycle
     if (this.options.dev) {
-      this.nuxt.hook('close', () => this.unwatch())
-    }
+      // Start watching after initial render
+      this.nuxt.hook('build:done', () => {
+        consola.info('Waiting for file changes')
+        this.watchClient()
+        this.watchRestart()
+      })
 
-    // Initialize shared FS and Cache
-    if (this.options.dev) {
-      this.mfs = new MFS()
+      // Close hook
+      this.nuxt.hook('close', () => this.close())
     }
 
     if (this.options.build.analyze) {
       this.nuxt.hook('build:done', () => {
-        consola.warn({
-          message: 'Notice: Please do not deploy bundles built with analyze mode, it\'s only for analyzing purpose.',
-          badge: true
-        })
+        consola.warn('Notice: Please do not deploy bundles built with analyze mode, it\'s only for analyzing purpose.')
       })
     }
 
     // Resolve template
-    this.template = this.options.build.template || '@nuxt/app'
+    this.template = this.options.build.template || '@nuxt/vue-app'
     if (typeof this.template === 'string') {
-      this.template = this.nuxt.resolver.requireModule(this.template)
+      this.template = this.nuxt.resolver.requireModule(this.template).template
     }
 
     // if(!this.options.dev) {
     // TODO: enable again when unsafe concern resolved.(common/options.js:42)
     // this.nuxt.hook('build:done', () => this.generateConfig())
     // }
+
+    this.bundleBuilder = this.getBundleBuilder(bundleBuilder)
+    this.ignore = new Ignore({
+      rootDir: this.options.srcDir
+    })
   }
 
-  normalizePlugins() {
-    return uniqBy(
-      this.options.plugins.map((p) => {
-        if (typeof p === 'string') p = { src: p }
-        const pluginBaseName = path.basename(p.src, path.extname(p.src)).replace(
-          /[^a-zA-Z?\d\s:]/g,
-          ''
-        )
-        return {
-          src: this.nuxt.resolver.resolveAlias(p.src),
-          ssr: p.ssr !== false,
-          name: 'nuxt_plugin_' + pluginBaseName + '_' + hash(p.src)
-        }
-      }),
-      p => p.name
-    )
+  getBundleBuilder(BundleBuilder) {
+    if (typeof BundleBuilder === 'object') {
+      return BundleBuilder
+    }
+
+    const context = new BuildContext(this)
+
+    if (typeof BundleBuilder !== 'function') {
+      ({ BundleBuilder } = require('@nuxt/webpack'))
+    }
+
+    return new BundleBuilder(context)
   }
 
   forGenerate() {
-    this.isStatic = true
+    this.bundleBuilder.forGenerate()
   }
 
   async build() {
     // Avoid calling build() method multiple times when dev:true
-    /* istanbul ignore if */
     if (this._buildStatus === STATUS.BUILD_DONE && this.options.dev) {
       return this
     }
     // If building
-    /* istanbul ignore if */
     if (this._buildStatus === STATUS.BUILDING) {
       await waitFor(1000)
       return this.build()
     }
     this._buildStatus = STATUS.BUILDING
 
-    consola.info({
-      message: 'Building project',
-      badge: true,
-      clear: !this.options.dev
-    })
+    if (this.options.dev) {
+      consola.info('Preparing project for development')
+      consola.info('Initial build may take a while')
+    } else {
+      consola.info('Production build')
+    }
 
     // Wait for nuxt ready
     await this.nuxt.ready()
@@ -146,25 +129,13 @@ export default class Builder {
     // Call before hook
     await this.nuxt.callHook('build:before', this, this.options.build)
 
-    // Check if pages dir exists and warn if not
-    this._nuxtPages = typeof this.options.build.createRoutes !== 'function'
-    if (this._nuxtPages) {
-      if (!fsExtra.existsSync(path.join(this.options.srcDir, this.options.dir.pages))) {
-        const dir = this.options.srcDir
-        if (fsExtra.existsSync(path.join(this.options.srcDir, '..', this.options.dir.pages))) {
-          throw new Error(
-            `No \`${this.options.dir.pages}\` directory found in ${dir}. Did you mean to run \`nuxt\` in the parent (\`../\`) directory?`
-          )
-        } else {
-          this._defaultPage = true
-          consola.warn({
-            message: `No \`${this.options.dir.pages}\` directory found in ${dir}.`,
-            additional: 'Using the default built-in page.\n',
-            additionalStyle: 'yellowBright',
-            badge: true
-          })
-        }
-      }
+    await this.validatePages()
+
+    // Validate template
+    try {
+      this.validateTemplate()
+    } catch (err) {
+      consola.fatal(err)
     }
 
     consola.success('Builder initialized')
@@ -185,8 +156,10 @@ export default class Builder {
     // Generate routes and interpret the template files
     await this.generateRoutesAndFiles()
 
-    // Start webpack build
-    await this.webpackBuild()
+    await this.resolvePlugins()
+
+    // Start bundle build: webpack, rollup, parcel...
+    await this.bundleBuilder.build()
 
     // Flag to set that building is done
     this._buildStatus = STATUS.BUILD_DONE
@@ -197,62 +170,142 @@ export default class Builder {
     return this
   }
 
-  async generateRoutesAndFiles() {
-    consola.debug(`Generating nuxt files`)
+  // Check if pages dir exists and warn if not
+  async validatePages() {
+    this._nuxtPages = typeof this.options.build.createRoutes !== 'function'
 
-    this.plugins = this.normalizePlugins()
+    if (
+      !this._nuxtPages ||
+      await fsExtra.exists(path.join(this.options.srcDir, this.options.dir.pages))
+    ) {
+      return
+    }
 
-    // -- Templates --
-    let templatesFiles = Array.from(this.template.templatesFiles)
+    const dir = this.options.srcDir
+    if (await fsExtra.exists(path.join(this.options.srcDir, '..', this.options.dir.pages))) {
+      throw new Error(
+        `No \`${this.options.dir.pages}\` directory found in ${dir}. Did you mean to run \`nuxt\` in the parent (\`../\`) directory?`
+      )
+    }
 
-    const templateVars = {
-      options: this.options,
-      extensions: this.options.extensions
-        .map(ext => ext.replace(/^\./, ''))
-        .join('|'),
-      messages: this.options.messages,
-      splitChunks: this.options.build.splitChunks,
-      uniqBy,
-      isDev: this.options.dev,
-      debug: this.options.debug,
-      vue: { config: this.options.vue.config },
-      mode: this.options.mode,
-      router: this.options.router,
-      env: this.options.env,
-      head: this.options.head,
-      middleware: fsExtra.existsSync(path.join(this.options.srcDir, this.options.dir.middleware)),
-      store: this.options.store,
-      globalName: this.options.globalName,
-      globals: this.globals,
-      css: this.options.css,
-      plugins: this.plugins,
-      appPath: './App.js',
-      ignorePrefix: this.options.ignorePrefix,
-      layouts: Object.assign({}, this.options.layouts),
-      loading:
-        typeof this.options.loading === 'string'
-          ? this.relativeToBuild(this.options.srcDir, this.options.loading)
-          : this.options.loading,
-      transition: this.options.transition,
-      layoutTransition: this.options.layoutTransition,
-      dir: this.options.dir,
-      components: {
-        ErrorPage: this.options.ErrorPage
-          ? this.relativeToBuild(this.options.ErrorPage)
-          : null
+    this._defaultPage = true
+    consola.warn(`No \`${this.options.dir.pages}\` directory found in ${dir}. Using the default built-in page.`)
+  }
+
+  validateTemplate() {
+    // Validate template dependencies
+    const templateDependencies = this.template.dependencies
+    const dependencyFixes = []
+    for (const depName in templateDependencies) {
+      const depVersion = templateDependencies[depName]
+      const requiredVersion = `${depName}@${depVersion}`
+
+      // Load installed version
+      const pkg = this.nuxt.resolver.requireModule(path.join(depName, 'package.json'))
+      if (pkg) {
+        const validVersion = semver.satisfies(pkg.version, depVersion)
+        if (!validVersion) {
+          consola.warn(`${requiredVersion} is required but ${depName}@${pkg.version} is installed!`)
+          dependencyFixes.push(requiredVersion)
+        }
+      } else {
+        consola.warn(`${depName}@${depVersion} is required but not installed!`)
+        dependencyFixes.push(requiredVersion)
       }
     }
 
-    // -- Layouts --
-    if (fsExtra.existsSync(path.resolve(this.options.srcDir, this.options.dir.layouts))) {
-      const layoutsFiles = await glob(`${this.options.dir.layouts}/**/*.{vue,js}`, {
-        cwd: this.options.srcDir,
-        ignore: this.options.ignore
-      })
-      layoutsFiles.forEach((file) => {
+    // Suggest dependency fixes (TODO: automate me)
+    if (dependencyFixes.length) {
+      consola.error(
+        'Please install missing dependencies:\n',
+        '\n',
+        'Using yarn:\n',
+        `yarn add ${dependencyFixes.join(' ')}\n`,
+        '\n',
+        'Using npm:\n',
+        `npm i ${dependencyFixes.join(' ')}\n`
+      )
+      throw new Error('Missing Template Dependencies')
+    }
+  }
+
+  async generateRoutesAndFiles() {
+    consola.debug('Generating nuxt files')
+
+    // Plugins
+    this.plugins = Array.from(this.normalizePlugins())
+
+    const templateContext = new TemplateContext(this, this.options)
+
+    await Promise.all([
+      this.resolveLayouts(templateContext),
+      this.resolveRoutes(templateContext),
+      this.resolveStore(templateContext),
+      this.resolveMiddleware(templateContext)
+    ])
+
+    await this.resolveCustomTemplates(templateContext)
+
+    await this.resolveLoadingIndicator(templateContext)
+
+    // Add vue-app template dir to watchers
+    this.options.build.watch.push(this.template.dir)
+
+    await this.compileTemplates(templateContext)
+
+    consola.success('Nuxt files generated')
+  }
+
+  normalizePlugins() {
+    return uniqBy(
+      this.options.plugins.map((p) => {
+        if (typeof p === 'string') {
+          p = { src: p }
+        }
+        const pluginBaseName = path.basename(p.src, path.extname(p.src)).replace(
+          /[^a-zA-Z?\d\s:]/g,
+          ''
+        )
+
+        if (p.ssr === false) {
+          p.mode = 'client'
+        } else if (p.mode === undefined) {
+          p.mode = 'all'
+        } else if (!['client', 'server', 'all'].includes(p.mode)) {
+          consola.warn(`Invalid plugin mode (server/client/all): '${p.mode}'. Falling back to 'all'`)
+          p.mode = 'all'
+        }
+
+        return {
+          src: this.nuxt.resolver.resolveAlias(p.src),
+          mode: p.mode,
+          name: 'nuxt_plugin_' + pluginBaseName + '_' + hash(p.src)
+        }
+      }),
+      p => p.name
+    )
+  }
+
+  async resolveFiles(dir, cwd = this.options.srcDir) {
+    return this.ignore.filter(await glob(`${dir}/**/*.{${this.supportedExtensions.join(',')}}`, {
+      cwd,
+      ignore: this.options.ignore
+    }))
+  }
+
+  async resolveRelative(dir) {
+    const dirPrefix = new RegExp(`^${dir}/`)
+    return (await this.resolveFiles(dir)).map(file => ({ src: file.replace(dirPrefix, '') }))
+  }
+
+  async resolveLayouts({ templateVars, templateFiles }) {
+    if (await fsExtra.exists(path.resolve(this.options.srcDir, this.options.dir.layouts))) {
+      for (const file of await this.resolveFiles(this.options.dir.layouts)) {
         const name = file
           .replace(new RegExp(`^${this.options.dir.layouts}/`), '')
-          .replace(/\.(vue|js)$/, '')
+          .replace(new RegExp(`\\.(${this.supportedExtensions.join('|')})$`), '')
+
+        // Layout Priority: module.addLayout > .vue file > other extensions
         if (name === 'error') {
           if (!templateVars.components.ErrorPage) {
             templateVars.components.ErrorPage = this.relativeToBuild(
@@ -260,49 +313,53 @@ export default class Builder {
               file
             )
           }
-          return
-        }
-        if (!templateVars.layouts[name] || /\.vue$/.test(file)) {
+        } else if (this.options.layouts[name]) {
+          consola.warn(`Duplicate layout registration, "${name}" has been registered as "${this.options.layouts[name]}"`)
+        } else if (!templateVars.layouts[name] || /\.vue$/.test(file)) {
           templateVars.layouts[name] = this.relativeToBuild(
             this.options.srcDir,
             file
           )
         }
-      })
+      }
     }
+
     // If no default layout, create its folder and add the default folder
     if (!templateVars.layouts.default) {
       await fsExtra.mkdirp(r(this.options.buildDir, 'layouts'))
-      templatesFiles.push('layouts/default.vue')
+      templateFiles.push('layouts/default.vue')
       templateVars.layouts.default = './layouts/default.vue'
     }
+  }
 
-    // -- Routes --
+  async resolveRoutes({ templateVars }) {
     consola.debug('Generating routes...')
 
     if (this._defaultPage) {
       templateVars.router.routes = createRoutes(
         ['index.vue'],
-        this.template.templatesDir + '/pages'
+        this.template.dir + '/pages',
+        '',
+        this.options.router.routeNameSplitter
       )
-    } else if (this._nuxtPages) { // If user defined a custom method to create routes
+    } else if (this._nuxtPages) {
       // Use nuxt.js createRoutes bases on pages/
       const files = {}
-      ;(await glob(`${this.options.dir.pages}/**/*.{vue,js}`, {
-        cwd: this.options.srcDir,
-        ignore: this.options.ignore
-      })).forEach((f) => {
-        const key = f.replace(/\.(js|vue)$/, '')
-        if (/\.vue$/.test(f) || !files[key]) {
-          files[key] = f.replace(/('|")/g, '\\$1')
+      const ext = new RegExp(`\\.(${this.supportedExtensions.join('|')})$`)
+      for (const page of await this.resolveFiles(this.options.dir.pages)) {
+        const key = page.replace(ext, '')
+        // .vue file takes precedence over other extensions
+        if (/\.vue$/.test(page) || !files[key]) {
+          files[key] = page.replace(/(['"])/g, '\\$1')
         }
-      })
+      }
       templateVars.router.routes = createRoutes(
         Object.values(files),
         this.options.srcDir,
-        this.options.dir.pages
+        this.options.dir.pages,
+        this.options.router.routeNameSplitter
       )
-    } else {
+    } else { // If user defined a custom method to create routes
       templateVars.router.routes = this.options.build.createRoutes(
         this.options.srcDir
       )
@@ -328,120 +385,154 @@ export default class Builder {
 
     // Make routes accessible for other modules and webpack configs
     this.routes = templateVars.router.routes
+  }
 
-    // -- Store --
+  async resolveStore({ templateVars, templateFiles }) {
     // Add store if needed
-    if (this.options.store) {
-      templatesFiles.push('store.js')
+    if (!this.options.store) {
+      return
     }
 
+    templateVars.storeModules = (await this.resolveRelative(this.options.dir.store))
+      .sort(({ src: p1 }, { src: p2 }) => {
+        // modules are sorted from low to high priority (for overwriting properties)
+        let res = p1.split('/').length - p2.split('/').length
+        if (res === 0 && p1.includes('/index.')) {
+          res = -1
+        } else if (res === 0 && p2.includes('/index.')) {
+          res = 1
+        }
+        return res
+      })
+
+    templateFiles.push('store.js')
+  }
+
+  async resolveMiddleware({ templateVars }) {
+    // -- Middleware --
+    templateVars.middleware = await this.resolveRelative(this.options.dir.middleware)
+  }
+
+  async resolveCustomTemplates(templateContext) {
     // Resolve template files
     const customTemplateFiles = this.options.build.templates.map(
       t => t.dst || path.basename(t.src || t)
     )
 
-    templatesFiles = templatesFiles
-      .map((file) => {
-        // Skip if custom file was already provided in build.templates[]
-        if (customTemplateFiles.includes(file)) {
-          return
-        }
-        // Allow override templates using a file with same name in ${srcDir}/app
-        const customPath = r(this.options.srcDir, 'app', file)
-        const customFileExists = fsExtra.existsSync(customPath)
+    const templateFiles = await Promise.all(templateContext.templateFiles.map(async (file) => {
+      // Skip if custom file was already provided in build.templates[]
+      if (customTemplateFiles.includes(file)) {
+        return
+      }
+      // Allow override templates using a file with same name in ${srcDir}/app
+      const customPath = r(this.options.srcDir, 'app', file)
+      const customFileExists = await fsExtra.exists(customPath)
 
-        return {
-          src: customFileExists ? customPath : r(this.template.templatesDir, file),
-          dst: file,
-          custom: customFileExists
-        }
-      })
-      .filter(i => !!i)
+      return {
+        src: customFileExists ? customPath : r(this.template.dir, file),
+        dst: file,
+        custom: customFileExists
+      }
+    }))
 
-    // -- Custom templates --
-    // Add custom template files
-    templatesFiles = templatesFiles.concat(
-      this.options.build.templates.map((t) => {
-        return Object.assign(
-          {
-            src: r(this.options.srcDir, t.src || t),
-            dst: t.dst || path.basename(t.src || t),
-            custom: true
-          },
-          t
-        )
-      })
+    templateContext.templateFiles = templateFiles
+      .filter(Boolean)
+      // Add custom template files
+      .concat(
+        this.options.build.templates.map((t) => {
+          return Object.assign(
+            {
+              src: r(this.options.srcDir, t.src || t),
+              dst: t.dst || path.basename(t.src || t),
+              custom: true
+            },
+            typeof t === 'object' ? t : undefined
+          )
+        })
+      )
+  }
+
+  async resolveLoadingIndicator({ templateFiles }) {
+    if (!this.options.loadingIndicator.name) {
+      return
+    }
+    let indicatorPath = path.resolve(
+      this.template.dir,
+      'views/loading',
+      this.options.loadingIndicator.name + '.html'
     )
 
-    // -- Loading indicator --
-    if (this.options.loadingIndicator.name) {
-      const indicatorPath1 = path.resolve(
-        this.template.templatesDir,
-        'views/loading',
-        this.options.loadingIndicator.name + '.html'
-      )
-      const indicatorPath2 = this.nuxt.resolver.resolveAlias(
+    let customIndicator = false
+    if (!await fsExtra.exists(indicatorPath)) {
+      indicatorPath = this.nuxt.resolver.resolveAlias(
         this.options.loadingIndicator.name
       )
-      const indicatorPath = fsExtra.existsSync(indicatorPath1)
-        ? indicatorPath1
-        : fsExtra.existsSync(indicatorPath2) ? indicatorPath2 : null
-      if (indicatorPath) {
-        templatesFiles.push({
-          src: indicatorPath,
-          dst: 'loading.html',
-          options: this.options.loadingIndicator
-        })
+
+      if (await fsExtra.exists(indicatorPath)) {
+        customIndicator = true
       } else {
-        /* istanbul ignore next */
-        // eslint-disable-next-line no-console
-        console.error(
-          `Could not fetch loading indicator: ${
-            this.options.loadingIndicator.name
-          }`
-        )
+        indicatorPath = null
       }
     }
 
+    if (!indicatorPath) {
+      consola.error(
+        `Could not fetch loading indicator: ${
+          this.options.loadingIndicator.name
+        }`
+      )
+      return
+    }
+
+    templateFiles.push({
+      src: indicatorPath,
+      dst: 'loading.html',
+      custom: customIndicator,
+      options: this.options.loadingIndicator
+    })
+  }
+
+  async compileTemplates(templateContext) {
+    // Prepare template options
+    const { templateVars, templateFiles, templateOptions } = templateContext
+
     await this.nuxt.callHook('build:templates', {
-      templatesFiles,
       templateVars,
+      templatesFiles: templateFiles,
       resolve: r
     })
 
+    templateOptions.imports = {
+      ...templateOptions.imports,
+      resolvePath: this.nuxt.resolver.resolvePath,
+      resolveAlias: this.nuxt.resolver.resolveAlias,
+      relativeToBuild: this.relativeToBuild
+    }
+
     // Interpret and move template files to .nuxt/
     await Promise.all(
-      templatesFiles.map(async ({ src, dst, options, custom }) => {
-        // Add template to watchers
-        this.options.build.watch.push(src)
+      templateFiles.map(async ({ src, dst, options, custom }) => {
+        // Add custom templates to watcher
+        if (custom) {
+          this.options.build.watch.push(src)
+        }
+
         // Render template to dst
         const fileContent = await fsExtra.readFile(src, 'utf8')
         let content
         try {
-          const templateFunction = template(fileContent, {
-            imports: {
-              serialize,
-              devalue,
-              hash,
-              r,
-              wp,
-              wChunk,
-              resolvePath: this.nuxt.resolver.resolvePath,
-              resolveAlias: this.nuxt.resolver.resolveAlias,
-              relativeToBuild: this.relativeToBuild
-            },
-            interpolate: /<%=([\s\S]+?)%>/g
-          })
-          content = templateFunction(
-            Object.assign({}, templateVars, {
-              options: options || {},
-              custom,
-              src,
-              dst
-            })
+          const templateFunction = template(fileContent, templateOptions)
+          content = stripWhitespace(
+            templateFunction(
+              Object.assign({}, templateVars, {
+                options: options || {},
+                custom,
+                src,
+                dst
+              })
+            )
           )
         } catch (err) {
-          /* istanbul ignore next */
           throw new Error(`Could not compile template ${src}: ${err.message}`)
         }
         const _path = r(this.options.buildDir, dst)
@@ -449,264 +540,163 @@ export default class Builder {
         await fsExtra.outputFile(_path, content, 'utf8')
       })
     )
-
-    consola.success('Nuxt files generated')
   }
 
-  async webpackBuild() {
-    this.perfLoader = new PerfLoader(this.options)
-
-    const compilersOptions = []
-
-    // Client
-    const clientConfig = new ClientWebpackConfig(this).config()
-    compilersOptions.push(clientConfig)
-
-    // Server
-    let serverConfig = null
-    if (this.options.build.ssr) {
-      serverConfig = new ServerWebpackConfig(this).config()
-      compilersOptions.push(serverConfig)
-    }
-
+  resolvePlugins() {
     // Check plugins exist then set alias to their real path
-    await Promise.all(this.plugins.map(async (p) => {
-      const ext = path.extname(p.src) ? '' : '{.+([^.]),/index.+([^.])}'
+    return Promise.all(this.plugins.map(async (p) => {
+      const ext = '{?(.+([^.])),/index.+([^.])}'
       const pluginFiles = await glob(`${p.src}${ext}`)
 
       if (!pluginFiles || pluginFiles.length === 0) {
         throw new Error(`Plugin not found: ${p.src}`)
-      } else if (pluginFiles.length > 1) {
+      }
+
+      if (pluginFiles.length > 1 && !isIndexFileAndFolder(pluginFiles)) {
         consola.warn({
           message: `Found ${pluginFiles.length} plugins that match the configuration, suggest to specify extension:`,
-          additional: `  ${pluginFiles.join('\n  ')}`,
-          badge: true
+          additional: '\n' + pluginFiles.map(x => `- ${x}`).join('\n')
         })
       }
 
-      const src = this.relativeToBuild(p.src)
-      // Client config
-      if (!clientConfig.resolve.alias[p.name]) {
-        clientConfig.resolve.alias[p.name] = src
-      }
-
-      // Server config
-      if (serverConfig && !serverConfig.resolve.alias[p.name]) {
-        // Alias to noop for ssr:false plugins
-        serverConfig.resolve.alias[p.name] = p.ssr ? src : './empty.js'
-      }
-    }))
-
-    // Configure compilers
-    this.compilers = compilersOptions.map((compilersOption) => {
-      const compiler = webpack(compilersOption)
-
-      // In dev, write files in memory FS
-      if (this.options.dev) {
-        compiler.outputFileSystem = this.mfs
-      }
-
-      return compiler
-    })
-
-    // Warmup perfLoader before build
-    if (this.options.build.parallel) {
-      consola.info('Warming up worker pools')
-      this.perfLoader.warmupAll()
-      consola.success('Worker pools ready')
-    }
-
-    // Start Builds
-    const runner = this.options.dev ? parallel : sequence
-
-    await runner(this.compilers, (compiler) => {
-      return this.webpackCompile(compiler)
-    })
-  }
-
-  webpackCompile(compiler) {
-    return new Promise(async (resolve, reject) => {
-      const name = compiler.options.name
-
-      await this.nuxt.callHook('build:compile', { name, compiler })
-
-      // Load renderer resources after build
-      compiler.hooks.done.tap('load-resources', async (stats) => {
-        await this.nuxt.callHook('build:compiled', {
-          name,
-          compiler,
-          stats
-        })
-
-        // Reload renderer if available
-        this.nuxt.renderer.loadResources(this.mfs || fs)
-
-        // Resolve on next tick
-        process.nextTick(resolve)
+      const modes = ['client', 'server']
+      const modePattern = new RegExp(`\\.(${modes.join('|')})\\.\\w+$`)
+      pluginFiles[0].replace(modePattern, (_, mode) => {
+        // mode in nuxt.config has higher priority
+        if (p.mode === 'all' && modes.includes(mode)) {
+          p.mode = mode
+        }
       })
 
-      if (this.options.dev) {
-        // --- Dev Build ---
-        // Client Build, watch is started by dev-middleware
-        if (compiler.options.name === 'client') {
-          return this.webpackDev(compiler)
-        }
-        // Server, build and watch for changes
-        this.compilersWatching.push(
-          compiler.watch(this.options.watchers.webpack, (err) => {
-            /* istanbul ignore if */
-            if (err) return reject(err)
-          })
-        )
-      } else {
-        // --- Production Build ---
-        compiler.run((err, stats) => {
-          /* istanbul ignore next */
-          if (err) {
-            return reject(err)
-          } else if (stats.hasErrors()) {
-            if (this.options.build.quiet === true) {
-              err = stats.toString(this.options.build.stats)
-            }
-            if (!err) {
-              // actual errors will be printed by webpack itself
-              err = 'Nuxt Build Error'
-            }
-
-            return reject(err)
-          }
-
-          resolve()
-        })
-      }
-    })
+      p.src = this.relativeToBuild(p.src)
+    }))
   }
 
-  webpackDev(compiler) {
-    consola.debug('Adding webpack middleware...')
+  // TODO: Uncomment when generateConfig enabled again
+  // async generateConfig() {
+  //   const config = path.resolve(this.options.buildDir, 'build.config.js')
+  //   const options = omit(this.options, Options.unsafeKeys)
+  //   await fsExtra.writeFile(
+  //     config,
+  //     `export default ${JSON.stringify(options, null, '  ')}`,
+  //     'utf8'
+  //   )
+  // }
 
-    // Create webpack dev middleware
-    this.webpackDevMiddleware = pify(
-      webpackDevMiddleware(
-        compiler,
-        Object.assign(
-          {
-            publicPath: this.options.build.publicPath,
-            stats: false,
-            logLevel: 'silent',
-            watchOptions: this.options.watchers.webpack
-          },
-          this.options.build.devMiddleware
-        )
-      )
-    )
+  createFileWatcher(patterns, events, listener, watcherCreatedCallback) {
+    const options = this.options.watchers.chokidar
+    const watcher = chokidar.watch(patterns, options)
 
-    this.webpackDevMiddleware.close = pify(this.webpackDevMiddleware.close)
-
-    this.webpackHotMiddleware = pify(
-      webpackHotMiddleware(
-        compiler,
-        Object.assign(
-          {
-            log: false,
-            heartbeat: 10000
-          },
-          this.options.build.hotMiddleware
-        )
-      )
-    )
-
-    // Inject to renderer instance
-    if (this.nuxt.renderer) {
-      this.nuxt.renderer.webpackDevMiddleware = this.webpackDevMiddleware
-      this.nuxt.renderer.webpackHotMiddleware = this.webpackHotMiddleware
+    for (const event of events) {
+      watcher.on(event, listener)
     }
 
-    // Start watching client files
-    this.watchClient()
+    const { rewatchOnRawEvents } = this.options.watchers
+    if (rewatchOnRawEvents && Array.isArray(rewatchOnRawEvents)) {
+      watcher.on('raw', (_event) => {
+        if (rewatchOnRawEvents.includes(_event)) {
+          watcher.close()
+
+          listener()
+          this.createFileWatcher(patterns, events, listener, watcherCreatedCallback)
+        }
+      })
+    }
+
+    if (typeof watcherCreatedCallback === 'function') {
+      watcherCreatedCallback(watcher)
+    }
+  }
+
+  assignWatcher(key) {
+    return (watcher) => {
+      this.watchers[key] = watcher
+    }
   }
 
   watchClient() {
     const src = this.options.srcDir
+    const rGlob = dir => ['*', '**/*'].map(glob => r(src, `${dir}/${glob}.{${this.supportedExtensions.join(',')}}`))
+
     let patterns = [
       r(src, this.options.dir.layouts),
       r(src, this.options.dir.store),
       r(src, this.options.dir.middleware),
-      r(src, `${this.options.dir.layouts}/*.{vue,js}`),
-      r(src, `${this.options.dir.layouts}/**/*.{vue,js}`)
+      ...rGlob(this.options.dir.layouts)
     ]
+
     if (this._nuxtPages) {
       patterns.push(
         r(src, this.options.dir.pages),
-        r(src, `${this.options.dir.pages}/*.{vue,js}`),
-        r(src, `${this.options.dir.pages}/**/*.{vue,js}`)
+        ...rGlob(this.options.dir.pages)
       )
     }
-    patterns = map(patterns, upath.normalizeSafe)
 
-    const options = this.options.watchers.chokidar
-    /* istanbul ignore next */
+    patterns = patterns.map(upath.normalizeSafe)
+
     const refreshFiles = debounce(() => this.generateRoutesAndFiles(), 200)
 
     // Watch for src Files
-    this.watchers.files = chokidar
-      .watch(patterns, options)
-      .on('add', refreshFiles)
-      .on('unlink', refreshFiles)
+    this.createFileWatcher(patterns, ['add', 'unlink'], refreshFiles, this.assignWatcher('files'))
 
     // Watch for custom provided files
-    let customPatterns = concat(
-      this.options.build.watch,
-      ...values(omit(this.options.build.styleResources, ['options']))
-    )
-    customPatterns = map(uniq(customPatterns), upath.normalizeSafe)
-    this.watchers.custom = chokidar
-      .watch(customPatterns, options)
-      .on('change', refreshFiles)
+    const customPatterns = uniq([
+      ...this.options.build.watch,
+      ...Object.values(omit(this.options.build.styleResources, ['options']))
+    ]).map(upath.normalizeSafe)
+
+    if (customPatterns.length === 0) {
+      return
+    }
+
+    this.createFileWatcher(customPatterns, ['change'], refreshFiles, this.assignWatcher('custom'))
   }
 
-  watchServer() {
-    const nuxtRestartWatch = concat(
-      this.options.serverMiddleware
-        .filter(i => typeof i === 'string')
-        .map(this.nuxt.resolver.resolveAlias),
-      this.options.watch.map(this.nuxt.resolver.resolveAlias),
-      path.join(this.options.rootDir, 'nuxt.config.js')
-    )
+  watchRestart() {
+    const nuxtRestartWatch = [
+      // Server middleware
+      ...this.options.serverMiddleware.filter(isString),
+      // Custom watchers
+      ...this.options.watch
+    ].map(this.nuxt.resolver.resolveAlias)
 
-    this.watchers.restart = chokidar
-      .watch(nuxtRestartWatch, this.options.watchers.chokidar)
-      .on('change', (_path) => {
-        this.watchers.restart.close()
-        const { name, ext } = path.parse(_path)
-        this.nuxt.callHook('watch:fileChanged', this, `${name}${ext}`)
-      })
+    if (this.ignore.ignoreFile) {
+      nuxtRestartWatch.push(this.ignore.ignoreFile)
+    }
+
+    this.createFileWatcher(
+      nuxtRestartWatch,
+      ['all'],
+      (event, _path) => {
+        if (['add', 'change', 'unlink'].includes(event) === false) {
+          return
+        }
+        this.nuxt.callHook('watch:fileChanged', this, _path) // Legacy
+        this.nuxt.callHook('watch:restart', { event, path: _path })
+      },
+      this.assignWatcher('restart')
+    )
   }
 
-  async unwatch() {
+  unwatch() {
     for (const watcher in this.watchers) {
-      if (this.watchers[watcher]) {
-        this.watchers[watcher].close()
-      }
-    }
-
-    this.compilersWatching.forEach(watching => watching.close())
-
-    // Stop webpack middleware
-    if (this.webpackDevMiddleware) {
-      await this.webpackDevMiddleware.close()
+      this.watchers[watcher].close()
     }
   }
 
-  // TODO: remove ignore when generateConfig enabled again
-  async generateConfig() /* istanbul ignore next */ {
-    const config = path.resolve(this.options.buildDir, 'build.config.js')
-    const options = omit(this.options, Options.unsafeKeys)
-    await fsExtra.writeFile(
-      config,
-      `export default ${JSON.stringify(options, null, '  ')}`,
-      'utf8'
-    )
+  async close() {
+    if (this.__closed) {
+      return
+    }
+    this.__closed = true
+
+    // Unwatch
+    this.unwatch()
+
+    // Close bundleBuilder
+    if (typeof this.bundleBuilder.close === 'function') {
+      await this.bundleBuilder.close()
+    }
   }
 }
 
